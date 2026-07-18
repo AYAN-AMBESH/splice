@@ -1,0 +1,765 @@
+// splice.mut
+// =============================================================================
+// Splice -- an authorization-enforced intercepting proxy, written in Mutant.
+//
+// The Burp/ZAP/mitmproxy slot, but with three properties those tools do not give
+// you for free:
+//
+//   1. Scope is ENFORCED policy, not an advisory UI setting. Every request is
+//      evaluated against policy/scope.rego BEFORE it can reach the forwarding
+//      path, so an out-of-scope host is literally unreachable through the proxy,
+//      and every allow/deny is traceable (policy_trace) -- a compliance artifact
+//      that proves you stayed in scope.
+//
+//   2. The site map is a real graph (db_*). Endpoints, params, and findings are
+//      nodes; db_shortest_path answers "what is the chain from an entry point to
+//      this sensitive sink?" instead of a flat tree + issue list.
+//
+//   3. Checks are sandboxed, hot-loadable Lua plugins (plugins/*.lua) -- Burp
+//      extensions without the JVM; the signed core never changes when you add one.
+//
+// Match/replace, secret-hunting and session state come from regex_*/cache_*.
+//
+// Runs in two modes, chosen by "mode" in splice.config.json:
+//   "selftest" -- drives the whole engine (policy, graph, match/replace, secret
+//                 hunt, plugins, attack-path) against synthetic flows with no
+//                 sockets, asserts every outcome, prints PASS/FAIL. This is the
+//                 end-to-end verification path.
+//   "proxy"    -- runs the live policy-gated intercepting proxy on cfg.bind.
+//
+// Build/run (see mutant-lang-quirks): compile then run.
+//   mutant.exe splice.mut --password test
+//   mutant.exe splice.mu  --password test --compat   (security active, sandbox advisory)
+// =============================================================================
+
+let CONFIG_PATH = "D:/Security Research/splice/splice.config.json";
+
+// ---------------------------------------------------------------------------
+// Low-level helpers (Mutant has no string escapes / no % / immutable indexes)
+// ---------------------------------------------------------------------------
+
+let ctrl = fn(n) { let c, e = bytes_char_from_int(n); return c; };
+let CR  = ctrl(13);
+let LF  = ctrl(10);
+let CRLF = CR + LF;
+
+let int_to_str = fn(n) {
+    if (n == 0) { return "0"; };
+    let s = "";
+    let x = n;
+    for (; x > 0; ) {
+        let d = x - (x / 10) * 10;
+        let ch, e = bytes_char_from_int(48 + d);
+        s = ch + s;
+        x = x / 10;
+    }
+    return s;
+};
+
+let str_to_int = fn(s) {
+    let acc = 0;
+    let i = 0;
+    for (; i < len(s); i = i + 1) {
+        let d, e = bytes_int_from_char(s[i]);
+        acc = acc * 10 + (d - 48);
+    }
+    return acc;
+};
+
+// safe hash field read with default (missing key is falsy in Mutant)
+let field = fn(h, k, d) {
+    let v = h[k];
+    if (v) { return v; };
+    return d;
+};
+
+let join = fn(root, rel) { return root + "/" + rel; };
+
+let host_only = fn(host_port) {
+    let parts = text_split(host_port, ":");
+    return parts[0];
+};
+
+// ---------------------------------------------------------------------------
+// Config
+// ---------------------------------------------------------------------------
+
+let load_config = fn(path) {
+    let raw, e1 = fs_read(path);
+    if (e1) {
+        putln("[fatal] cannot read config ", path, ": ", e1);
+        return false;
+    };
+    let cfg, e2 = json_parse(raw);
+    if (e2) {
+        putln("[fatal] cannot parse config: ", e2);
+        return false;
+    };
+    return cfg;
+};
+
+// ---------------------------------------------------------------------------
+// Policy layer -- enforced scope / RoE
+// ---------------------------------------------------------------------------
+
+// Returns a decision hash {allow, reason, host_in_scope, trace_events}. Denies
+// fail closed: any evaluation error is treated as "deny".
+let decide = fn(pol_module, host, method, path) {
+    let pol = {"module": pol_module};
+    let input = {"host": host, "method": method, "path": path};
+    let res, err = policy_eval(pol, input);
+    if (err) {
+        return {"allow": false, "reason": "policy error (fail closed)", "host_in_scope": false, "trace_events": 0};
+    };
+    let dec = res["decision"];
+    let tr, terr = policy_trace(pol, input);
+    let n = 0;
+    if (tr) { n = len(tr); };
+    return {
+        "allow": res["allow"],
+        "reason": field(dec, "reason", "unknown"),
+        "host_in_scope": field(dec, "host_in_scope", false),
+        "trace_events": n
+    };
+};
+
+// ---------------------------------------------------------------------------
+// Graph site-map layer (db_* + cache dedup)
+// ---------------------------------------------------------------------------
+
+// intern_node: return an existing node id for `key`, else create one and cache
+// the mapping. Node ids are kept exact by round-tripping as strings (cache
+// stores JSON, which would float an int).
+let intern_node = fn(db, kind, key, attrs) {
+    let hit, he = cache_get("splice_nodes", key);
+    if (hit["found"]) {
+        return str_to_int(hit["value"]);
+    };
+    let node, ne = db_add_artifact(db, kind, attrs);
+    let id = node["node_id"];
+    let p, pe = cache_put("splice_nodes", key, int_to_str(id));
+    return id;
+};
+
+let link = fn(db, src, dst, rel) {
+    let r, e = db_add_relation(db, src, dst, rel);
+    return true;
+};
+
+// record_flow: fold one request/response into the site-map graph and return the
+// endpoint node id (so callers can attach findings and compute attack paths).
+let record_flow = fn(db, host, method, path, query) {
+    let hattrs = {"host": host};
+    let host_id = intern_node(db, "host", "host:" + host, hattrs);
+
+    let ep_key = "ep:" + method + " " + host + path;
+    let eattrs = {"host": host, "method": method, "path": path};
+    let ep_id = intern_node(db, "endpoint", ep_key, eattrs);
+    link(db, host_id, ep_id, "serves");
+
+    if (query != "") {
+        let pairs = text_split(query, "&");
+        let i = 0;
+        for (; i < len(pairs); i = i + 1) {
+            let kv = text_split(pairs[i], "=");
+            let name = kv[0];
+            if (name != "") {
+                let pkey = "param:" + host + path + "?" + name;
+                let pattrs = {"name": name, "endpoint": ep_key};
+                let p_id = intern_node(db, "param", pkey, pattrs);
+                link(db, ep_id, p_id, "has_param");
+            };
+        }
+    };
+    return ep_id;
+};
+
+// record_finding: attach a finding node to an endpoint node and return its id.
+let record_finding = fn(db, ep_id, finding) {
+    let fattrs = {
+        "severity": field(finding, "severity", "info"),
+        "title": field(finding, "title", "finding"),
+        "detail": field(finding, "detail", ""),
+        "source": field(finding, "source", "plugin")
+    };
+    let f_node, fe = db_add_artifact(db, "finding", fattrs);
+    let f_id = f_node["node_id"];
+    link(db, ep_id, f_id, "has_finding");
+    return f_id;
+};
+
+// ---------------------------------------------------------------------------
+// Secret hunting (native regex) -- runs on every response body
+// ---------------------------------------------------------------------------
+
+let hunt_secrets = fn(text) {
+    let out = [];
+    let ok1, e1 = regex_match("-----BEGIN [A-Z ]*PRIVATE KEY-----", text);
+    if (ok1) {
+        let f = {"severity": "high", "title": "Private key in response body", "detail": "pem-private-key", "source": "regex"};
+        out = push(out, f);
+    };
+    let ok2, e2 = regex_match("AKIA[0-9A-Z]{16}", text);
+    if (ok2) {
+        let f = {"severity": "high", "title": "AWS access key id in body", "detail": "AKIA...", "source": "regex"};
+        out = push(out, f);
+    };
+    let ok3, e3 = regex_match("eyJ[A-Za-z0-9_-]{6,}\\.eyJ[A-Za-z0-9_-]{6,}\\.[A-Za-z0-9_-]{6,}", text);
+    if (ok3) {
+        let f = {"severity": "medium", "title": "JSON Web Token in body", "detail": "jwt", "source": "regex"};
+        out = push(out, f);
+    };
+    return out;
+};
+
+// ---------------------------------------------------------------------------
+// Lua check plugins -- sandboxed, hot-loadable
+// ---------------------------------------------------------------------------
+
+// lua_literal: wrap a value as a Lua long-bracket literal so injected context
+// never needs quote-escaping and cannot break out of its own delimiter.
+let lua_literal = fn(s) {
+    let ob = ctrl(91);   // [
+    let cb = ctrl(93);   // ]
+    let eq = "=====";
+    let open = ob + eq + ob;
+    let close = cb + eq + cb;
+    let safe, e = regex_replace(close, s, " ");
+    return open + safe + close;
+};
+
+let build_preamble = fn(ctx) {
+    let sp = " ";
+    let s = "";
+    s = s + "SPLICE_PHASE="  + lua_literal(field(ctx, "phase", ""))  + sp;
+    s = s + "SPLICE_METHOD=" + lua_literal(field(ctx, "method", "")) + sp;
+    s = s + "SPLICE_HOST="   + lua_literal(field(ctx, "host", ""))   + sp;
+    s = s + "SPLICE_PATH="   + lua_literal(field(ctx, "path", ""))   + sp;
+    s = s + "SPLICE_QUERY="  + lua_literal(field(ctx, "query", ""))  + sp;
+    s = s + "SPLICE_STATUS=" + lua_literal(field(ctx, "status", "")) + sp;
+    s = s + "SPLICE_BODY="   + lua_literal(field(ctx, "body", ""))   + sp;
+    s = s + "SPLICE_RAW="    + lua_literal(field(ctx, "raw", ""))    + sp;
+    return s;
+};
+
+// run_plugins: execute every configured Lua plugin against one flow context and
+// return a flat array of finding hashes.
+let run_plugins = fn(plugins, root, ctx) {
+    let preamble = build_preamble(ctx);
+    let out = [];
+    let i = 0;
+    for (; i < len(plugins); i = i + 1) {
+        let body, be = fs_read(join(root, plugins[i]));
+        if (be) {
+            putln("  [plugin] cannot read ", plugins[i], ": ", be);
+        } else {
+            let src = preamble + body;
+            let lr, lre = lua_run_string(src);
+            if (lr["ok"]) {
+                let arr, ae = json_parse(lr["result"]);
+                if (ae) {
+                    putln("  [plugin] ", plugins[i], " returned non-JSON: ", lr["result"]);
+                } else {
+                    let j = 0;
+                    for (; j < len(arr); j = j + 1) {
+                        let f = arr[j];
+                        // Tag with provenance (which plugin). Hashes are
+                        // immutable, so rebuild with a known shape + source.
+                        let tagged = {
+                            "severity": field(f, "severity", "info"),
+                            "title": field(f, "title", "finding"),
+                            "detail": field(f, "detail", ""),
+                            "source": plugins[i]
+                        };
+                        out = push(out, tagged);
+                    }
+                }
+            } else {
+                putln("  [plugin] ", plugins[i], " error: ", lr["error"]);
+            }
+        }
+    }
+    return out;
+};
+
+// ---------------------------------------------------------------------------
+// Match / replace (Burp-style, regex over the outgoing request wire)
+// ---------------------------------------------------------------------------
+
+let load_rules = fn(root, rel) {
+    let raw, e1 = fs_read(join(root, rel));
+    if (e1) { return []; };
+    let doc, e2 = json_parse(raw);
+    if (e2) { return []; };
+    return field(doc, "rules", []);
+};
+
+let apply_matchreplace = fn(rules, wire) {
+    let out = wire;
+    let i = 0;
+    for (; i < len(rules); i = i + 1) {
+        let rule = rules[i];
+        let pat = field(rule, "pattern", "");
+        let rep = field(rule, "replacement", "");
+        if (pat) {
+            let next, e = regex_replace(pat, out, rep);
+            if (e) {
+                putln("  [matchreplace] bad rule ", field(rule, "name", "?"), ": ", e);
+            } else {
+                out = next;
+            };
+        };
+    }
+    return out;
+};
+
+// ---------------------------------------------------------------------------
+// Flow context builder (shared by proxy + selftest)
+// ---------------------------------------------------------------------------
+
+let build_ctx = fn(phase, method, host, path, query, status, body, raw) {
+    return {
+        "phase": phase, "method": method, "host": host, "path": path,
+        "query": query, "status": status, "body": body, "raw": raw
+    };
+};
+
+// analyze_response: run secret-hunt + plugins over a response and fold every
+// finding into the graph under `ep_id`. Returns the count of findings.
+let analyze_response = fn(st, ep_id, method, host, path, query, resp) {
+    let body = field(resp, "body", "");
+    let status = field(resp, "status", 0);
+    let raw, re = http_build_response(resp);
+    let ctx = build_ctx("response", method, host, path, query, int_to_str(status), body, raw);
+
+    let secrets = hunt_secrets(body);
+    let plug = run_plugins(st["plugins"], st["root"], ctx);
+
+    let all = [];
+    let i = 0;
+    for (; i < len(secrets); i = i + 1) { all = push(all, secrets[i]); }
+    let j = 0;
+    for (; j < len(plug); j = j + 1) { all = push(all, plug[j]); }
+
+    let k = 0;
+    for (; k < len(all); k = k + 1) {
+        let f = all[k];
+        record_finding(st["db"], ep_id, f);
+        putln("    [finding] ", field(f, "severity", "?"), " :: ", field(f, "title", "?"),
+              " (", field(f, "source", "?"), ")");
+    }
+    return len(all);
+};
+
+// ---------------------------------------------------------------------------
+// Live proxy I/O
+// ---------------------------------------------------------------------------
+
+let deny_response = fn(reason) {
+    let body = "Splice: request blocked by engagement policy -- " + reason;
+    let resp = {"status": 403, "status_text": "Forbidden", "body": body, "headers": {}};
+    let wire, e = http_build_response(resp);
+    return wire;
+};
+
+// audit: append one tamper-evident decision line to the on-disk audit trail
+// (config `audit_log`). This is the persisted proof-of-scope artifact.
+let audit = fn(st, verdict, host, method, path, reason) {
+    let lg = st["audit_log"];
+    if (lg != "") {
+        let line = verdict + " " + method + " " + host + path + " :: " + reason + LF;
+        let w, we = fs_append(lg, line);
+    };
+};
+
+// open_https_upstream: return {ok, handle} for a connection over which we can do
+// a TLS handshake to `host_port`. When cfg.upstream_proxy is set (proxy chaining,
+// e.g. Browser -> Splice -> Burp -> target), it opens a CONNECT tunnel THROUGH
+// that downstream proxy; otherwise it dials the origin directly.
+let open_https_upstream = fn(host_port, cfg) {
+    let up_proxy = field(cfg, "upstream_proxy", "");
+    if (up_proxy != "") {
+        let t, te = net_connect(up_proxy, field(cfg, "connect_timeout_ms", 8000));
+        if (te) { return {"ok": false, "handle": 0, "err": te}; };
+        let creq = "CONNECT " + host_port + " HTTP/1.1" + CRLF + "Host: " + host_port + CRLF + CRLF;
+        net_conn_write(t, creq);
+        // A CONNECT reply is a status line + headers with NO body, so read raw
+        // bytes (up to the blank line) rather than http_conn_read_response, which
+        // would block trying to read a body that never arrives.
+        let rd, rde = net_conn_read(t, 4096, field(cfg, "upstream_timeout_ms", 15000));
+        if (rde) { net_conn_close(t); return {"ok": false, "handle": 0, "err": rde}; };
+        let ok200, o2e = regex_match("^HTTP/1.[0-9] 2[0-9][0-9]", rd["data"]);
+        if (ok200) { return {"ok": true, "handle": t, "err": ""}; };
+        net_conn_close(t);
+        return {"ok": false, "handle": 0, "err": "proxy CONNECT non-200"};
+    };
+    let u, ue = net_connect(host_port, field(cfg, "connect_timeout_ms", 8000));
+    if (ue) { return {"ok": false, "handle": 0, "err": ue}; };
+    return {"ok": true, "handle": u, "err": ""};
+};
+
+let relay_https = fn(host_port, host, request, cfg) {
+    let conn = open_https_upstream(host_port, cfg);
+    if (conn["ok"] == false) {
+        putln("  [!] upstream connect failed to ", host_port, " :: ", conn["err"]);
+        return {"status": 502, "status_text": "Bad Gateway", "body": "splice: upstream connect failed", "headers": {}};
+    };
+    let upstream = conn["handle"];
+    // Verify the real upstream cert in direct mode. Only when chaining through a
+    // downstream proxy (Burp), which presents its own MITM leaf, do we optionally
+    // relax verification via upstream_tls_insecure.
+    let insec = false;
+    if (field(cfg, "upstream_proxy", "") != "") { insec = field(cfg, "upstream_tls_insecure", false); };
+    let opts = {"server_name": host, "insecure": insec};
+    let info, terr = net_tls_upgrade_client(upstream, opts);
+    if (terr) {
+        net_conn_close(upstream);
+        return {"status": 502, "status_text": "Bad Gateway", "body": "splice: upstream TLS failed", "headers": {}};
+    };
+    let wire, we = http_build_request(request);
+    let mutated = apply_matchreplace(field(cfg, "rules", []), wire);
+    net_conn_write(upstream, mutated);
+    let resp, rerr = http_conn_read_response(upstream, field(cfg, "upstream_timeout_ms", 15000));
+    net_conn_close(upstream);
+    if (rerr) {
+        return {"status": 502, "status_text": "Bad Gateway", "body": "splice: upstream read failed", "headers": {}};
+    };
+    return resp;
+};
+
+let handle_connect = fn(client, st, host_port) {
+    let host = host_only(host_port);
+    let cfg = st["cfg"];
+
+    // Scope-check the CONNECT target BEFORE establishing the tunnel.
+    let d = decide(st["pol"], host, "CONNECT", "");
+    if (d["allow"]) {
+        putln("  [allow ] CONNECT ", host, " (", d["reason"], ", trace ", d["trace_events"], " events)");
+        audit(st, "ALLOW", host, "CONNECT", "", d["reason"]);
+    } else {
+        putln("  [DENY  ] CONNECT ", host, " (", d["reason"], ")");
+        audit(st, "DENY", host, "CONNECT", "", d["reason"]);
+        net_conn_write(client, deny_response(d["reason"]));
+        net_conn_close(client);
+        return false;
+    };
+
+    net_conn_write(client, "HTTP/1.1 200 Connection Established" + CRLF + CRLF);
+
+    let names = [host];
+    let leaf_opts = {"common_name": host, "dns_names": names};
+    let ca = st["ca"];
+    let leaf, le = tls_sign_cert(ca["cert_pem"], ca["key_pem"], leaf_opts);
+    if (le) {
+        putln("  [!] leaf issuance failed: ", le);
+        net_conn_close(client);
+        return false;
+    };
+    let up, ue = net_tls_upgrade_server(client, leaf["cert_pem"], leaf["key_pem"]);
+    if (ue) {
+        net_conn_close(client);
+        return false;
+    };
+
+    let request, qe = http_conn_read_request(client, field(cfg, "upstream_timeout_ms", 15000));
+    if (qe) {
+        net_conn_close(client);
+        return false;
+    };
+
+    let method = field(request, "method", "GET");
+    let path = field(request, "path", "/");
+    let query = field(request, "query", "");
+
+    // Re-check the decrypted request against per-path policy.
+    let d2 = decide(st["pol"], host, method, path);
+    if (d2["allow"]) {
+        audit(st, "ALLOW", host, method, path, d2["reason"]);
+        let ep_id = record_flow(st["db"], host, method, path, query);
+        putln("  [intercept] ", method, " https://", host, path);
+        let resp = relay_https(host_port, host, request, cfg);
+        putln("  [response ] ", field(resp, "status", 0));
+        analyze_response(st, ep_id, method, host, path, query, resp);
+        let back, be = http_build_response(resp);
+        net_conn_write(client, back);
+    } else {
+        putln("  [DENY  ] ", method, " https://", host, path, " (", d2["reason"], ")");
+        audit(st, "DENY", host, method, path, d2["reason"]);
+        net_conn_write(client, deny_response(d2["reason"]));
+    };
+    net_conn_close(client);
+    return true;
+};
+
+let handle_plain = fn(client, st, request) {
+    let cfg = st["cfg"];
+    let host = field(request, "host", "");
+    let method = field(request, "method", "GET");
+    let path = field(request, "path", "/");
+    let query = field(request, "query", "");
+
+    let d = decide(st["pol"], host, method, path);
+    if (d["allow"]) {
+        putln("  [allow ] ", method, " http://", host, path, " (", d["reason"], ")");
+        audit(st, "ALLOW", host, method, path, d["reason"]);
+    } else {
+        putln("  [DENY  ] ", method, " http://", host, path, " (", d["reason"], ")");
+        audit(st, "DENY", host, method, path, d["reason"]);
+        net_conn_write(client, deny_response(d["reason"]));
+        net_conn_close(client);
+        return false;
+    };
+
+    let ep_id = record_flow(st["db"], host, method, path, query);
+    // Plain HTTP forwards absolute-form. To a downstream proxy (Burp) that IS
+    // the wire format it expects, so we only switch the dial target; to an
+    // origin we send it directly on :80.
+    let up_proxy = field(cfg, "upstream_proxy", "");
+    let target = host + ":80";
+    if (up_proxy != "") { target = up_proxy; };
+    let upstream, err = net_connect(target, field(cfg, "connect_timeout_ms", 8000));
+    if (err) {
+        net_conn_write(client, deny_response("upstream connect failed"));
+        net_conn_close(client);
+        return false;
+    };
+    let wire, we = http_build_request(request);
+    let mutated = apply_matchreplace(field(cfg, "rules", []), wire);
+    net_conn_write(upstream, mutated);
+    let resp, rerr = http_conn_read_response(upstream, field(cfg, "upstream_timeout_ms", 15000));
+    net_conn_close(upstream);
+    if (rerr) {
+        net_conn_write(client, deny_response("upstream read failed"));
+        net_conn_close(client);
+        return false;
+    };
+    putln("  [response ] ", field(resp, "status", 0));
+    analyze_response(st, ep_id, method, host, path, query, resp);
+    let back, be = http_build_response(resp);
+    net_conn_write(client, back);
+    net_conn_close(client);
+    return true;
+};
+
+let handle_client = fn(client, st) {
+    let cfg = st["cfg"];
+    let request, err = http_conn_read_request(client, field(cfg, "upstream_timeout_ms", 15000));
+    if (err) {
+        net_conn_close(client);
+        return false;
+    };
+    if (field(request, "method", "") == "CONNECT") {
+        return handle_connect(client, st, field(request, "host", ""));
+    };
+    return handle_plain(client, st, request);
+};
+
+// load_or_make_ca: reuse a persistent CA from disk when ca_cert_path/ca_key_path
+// point at existing PEM files, otherwise generate one and (if paths are given)
+// write it there. A stable CA means the browser / Burp import it ONCE instead of
+// re-trusting a fresh CA every run. Returns a {cert_pem, key_pem, ...} hash or
+// false on failure.
+let load_or_make_ca = fn(cfg) {
+    let cert_path = field(cfg, "ca_cert_path", "");
+    let key_path = field(cfg, "ca_key_path", "");
+    if (cert_path != "") {
+        let existing, ee = fs_exists(cert_path);
+        if (existing) {
+            let cert, ce = fs_read(cert_path);
+            let key, ke = fs_read(key_path);
+            if (ce) {} else {
+                if (ke) {} else {
+                    putln("[ca] reusing persistent CA from ", cert_path);
+                    return {"cert_pem": cert, "key_pem": key, "loaded": true};
+                };
+            };
+        };
+    };
+    let ca_opts = {"common_name": field(cfg, "ca_common_name", "Splice Intercept CA"),
+                   "organization": field(cfg, "ca_organization", "Splice")};
+    let ca, cae = tls_generate_ca(ca_opts);
+    if (cae) { return false; };
+    if (cert_path != "") {
+        let w1, w1e = fs_write(cert_path, ca["cert_pem"]);
+        let w2, w2e = fs_write(key_path, ca["key_pem"]);
+        putln("[ca] generated new CA and wrote ", cert_path, " (import this into your browser / Burp)");
+    };
+    return ca;
+};
+
+let run_proxy = fn(st) {
+    let cfg = st["cfg"];
+    let bind = field(cfg, "bind", "127.0.0.1:8080");
+    putln("=== Splice intercepting proxy ===");
+    putln("Trust this CA certificate in your client to intercept HTTPS:");
+    putln(st["ca"]["cert_pem"]);
+    let ln, err = net_listen(bind);
+    if (err) {
+        putln("listen failed: ", err);
+        return false;
+    };
+    putln("proxy listening on ", bind, " (set as HTTP+HTTPS proxy). Scope enforced by policy/scope.rego.");
+    for (let i = 0; true; i = i + 1) {
+        let acc, ae = net_accept(ln, 0);
+        if (acc["ok"]) {
+            handle_client(acc["handle"], st);
+        };
+    }
+    return true;
+};
+
+// ---------------------------------------------------------------------------
+// Self-test: exercise the whole engine against synthetic flows, no sockets.
+// ---------------------------------------------------------------------------
+
+let PASS = 0;
+let FAIL = 0;
+let check = fn(name, cond) {
+    if (cond) {
+        PASS = PASS + 1;
+        putln("  PASS  ", name);
+    } else {
+        FAIL = FAIL + 1;
+        putln("  FAIL  ", name);
+    };
+};
+
+let run_selftest = fn(st) {
+    putln("=== Splice self-test (engine, no sockets) ===");
+    let pol = st["pol"];
+    let db = st["db"];
+
+    putln("");
+    putln("[1] Policy enforcement (scope / RoE)");
+    // Uses hosts from the active engagement scope (policy/scope.rego).
+    let a = decide(pol, "whokilledtulpa.com", "GET", "/users");
+    check("in-scope GET allowed", a["allow"]);
+    check("in-scope decision is traceable", a["trace_events"] > 0);
+    let b = decide(pol, "evil.example", "GET", "/");
+    check("out-of-scope host denied", b["allow"] == false);
+    check("deny reason is out-of-scope", b["reason"] == "out-of-scope host");
+    let c = decide(pol, "whokilledtulpa.com", "DELETE", "/users/1");
+    check("disallowed method denied", c["allow"] == false);
+    let e = decide(pol, "whokilledtulpa.com", "POST", "/logout");
+    check("denied path blocked on in-scope host", e["allow"] == false);
+    check("deny reason is path", e["reason"] == "path explicitly denied");
+
+    putln("");
+    putln("[2] Match / replace on outgoing request wire");
+    let req = {"method": "GET", "url": "/search?q=hi&utm_source=news", "host": "api.target.test",
+               "headers": {"User-Agent": "curl/8.0"}, "body": ""};
+    let wire, we = http_build_request(req);
+    let mutated = apply_matchreplace(field(st["cfg"], "rules", []), wire);
+    let uaok, uae = regex_match("Splice/1.0", mutated);
+    check("user-agent pinned by match/replace", uaok);
+    let tagok, tage = regex_match("X-Splice-Tester: authorized-engagement", mutated);
+    check("engagement tag header injected", tagok);
+    let utmgone, ug = regex_match("utm_source", mutated);
+    check("utm tracking param stripped", utmgone == false);
+
+    putln("");
+    putln("[3] Graph site-map + finding correlation");
+    // Simulated flows: an unauthenticated entry point that links to a search
+    // endpoint whose response reflects a parameter and leaks a private key.
+    let entry_ep = record_flow(db, "www.target.test", "GET", "/login", "");
+    let search_ep = record_flow(db, "www.target.test", "GET", "/search", "q=canarytoken1234");
+    link(db, entry_ep, search_ep, "links_to");
+
+    let leak_body = "results for canarytoken1234 ... -----BEGIN RSA PRIVATE KEY-----MIIEx";
+    let resp = {"status": 200, "status_text": "OK", "body": leak_body,
+                "headers": {"Content-Type": "text/html"}};
+    let nfound = analyze_response(st, search_ep, "GET", "www.target.test", "/search", "q=canarytoken1234", resp);
+    check("findings recorded for search endpoint", nfound > 0);
+
+    let stats, se = db_stats(db);
+    check("graph has nodes", stats["nodes"] > 0);
+    check("graph has edges", stats["edges"] > 0);
+    putln("  graph: ", stats["nodes"], " nodes, ", stats["edges"], " edges");
+
+    putln("");
+    putln("[4] Attack-path query (entry point -> sensitive sink)");
+    // Attach a dedicated high-severity sink finding and path to it.
+    let sink = {"severity": "high", "title": "Reflected + key leak sink", "detail": "search", "source": "correlation"};
+    let sink_id = record_finding(db, search_ep, sink);
+    let path, pe = db_shortest_path(db, entry_ep, sink_id);
+    check("path exists from entry to sink", len(path) > 2);
+    putln("  chain (node ids): ", path[0], " -> ", path[1], " -> ", path[2],
+          "  (login endpoint -> search endpoint -> finding)");
+
+    putln("");
+    putln("=== Self-test complete: ", PASS, " passed, ", FAIL, " failed ===");
+    if (FAIL == 0) {
+        putln("RESULT: OK");
+    } else {
+        putln("RESULT: FAILURES PRESENT");
+    };
+    return FAIL == 0;
+};
+
+// ---------------------------------------------------------------------------
+// Entry point
+// ---------------------------------------------------------------------------
+
+let main = fn() {
+    let cfg = load_config(CONFIG_PATH);
+    if (cfg == false) { return false; };
+    let root = field(cfg, "root", ".");
+
+    let pol_module, pe = fs_read(join(root, field(cfg, "policy_path", "policy/scope.rego")));
+    if (pe) {
+        putln("[fatal] cannot read policy: ", pe);
+        return false;
+    };
+
+    let rules = load_rules(root, field(cfg, "matchreplace_path", "matchreplace/rules.json"));
+    let db, de = db_open();
+    let c, ce = cache_open("splice_nodes");
+
+    // cfg augmented with parsed rules for the proxy path.
+    let cfg2 = {
+        "bind": field(cfg, "bind", "127.0.0.1:8080"),
+        "rules": rules,
+        "connect_timeout_ms": field(cfg, "connect_timeout_ms", 8000),
+        "upstream_timeout_ms": field(cfg, "upstream_timeout_ms", 15000),
+        "upstream_proxy": field(cfg, "upstream_proxy", ""),
+        "upstream_tls_insecure": field(cfg, "upstream_tls_insecure", false)
+    };
+
+    let audit_log = "";
+    if (field(cfg, "audit_log", "") != "") { audit_log = join(root, field(cfg, "audit_log", "")); };
+
+    let st = {
+        "cfg": cfg2,
+        "pol": pol_module,
+        "db": db,
+        "plugins": field(cfg, "plugins", []),
+        "root": root,
+        "audit_log": audit_log
+    };
+
+    let mode = field(cfg, "mode", "selftest");
+    if (mode == "selftest") {
+        return run_selftest(st);
+    };
+
+    let ca_cfg = {
+        "ca_cert_path": join(root, field(cfg, "ca_cert_path", "ca/splice-ca.pem")),
+        "ca_key_path": join(root, field(cfg, "ca_key_path", "ca/splice-ca-key.pem")),
+        "ca_common_name": field(cfg, "ca_common_name", "Splice Intercept CA"),
+        "ca_organization": field(cfg, "ca_organization", "Splice")
+    };
+    let ca = load_or_make_ca(ca_cfg);
+    if (ca == false) {
+        putln("[fatal] CA generation failed");
+        return false;
+    };
+    let st2 = {
+        "cfg": cfg2, "pol": pol_module, "db": db,
+        "plugins": field(cfg, "plugins", []), "root": root, "ca": ca,
+        "audit_log": audit_log
+    };
+    return run_proxy(st2);
+};
+
+let done = main();
+putln("");

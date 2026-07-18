@@ -1,0 +1,20 @@
+{
+  "_comment": "Burp-style match/replace applied in order as Go RE2 regex to the outgoing request wire. Use [^\\r\\n] (NOT .*) so a rule never eats the CRLF and corrupts header framing. JSON escapes (\\r\\n) become real CRLF after parsing.",
+  "rules": [
+    {
+      "name": "pin-user-agent",
+      "pattern": "(?m)^User-Agent:[^\\r\\n]*",
+      "replacement": "User-Agent: Splice/1.0 (authorized security testing)"
+    },
+    {
+      "name": "tag-engagement",
+      "pattern": "(?m)^(Host:[^\\r\\n]*)",
+      "replacement": "$1\r\nX-Splice-Tester: authorized-engagement"
+    },
+    {
+      "name": "strip-utm-tracking",
+      "pattern": "([?&])utm_[a-z]+=[^&\\r\\n ]*",
+      "replacement": "$1"
+    }
+  ]
+}

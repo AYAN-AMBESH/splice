@@ -1,0 +1,25 @@
+{
+  "_mode_help": "proxy = run the live intercepting proxy; selftest = run the offline engine self-test (14 assertions).",
+  "mode": "proxy",
+  "root": "D:/Security Research/splice",
+  "_bind_help": "Splice's own listener. Burp already uses 8080 on this box, so Splice binds 8123.",
+  "bind": "127.0.0.1:8123",
+  "policy_path": "policy/scope.rego",
+  "matchreplace_path": "matchreplace/rules.json",
+  "plugins": [
+    "plugins/secret_leak.lua",
+    "plugins/security_headers.lua",
+    "plugins/reflected_input.lua"
+  ],
+  "_ca_help": "Persistent CA: generated on first run and written to these paths (relative to root). Import ca/splice-ca.pem into your browser / Burp ONCE. Delete the files to rotate.",
+  "ca_common_name": "Splice Intercept CA",
+  "ca_organization": "Splice",
+  "ca_cert_path": "ca/splice-ca.pem",
+  "ca_key_path": "ca/splice-ca-key.pem",
+  "audit_log": "splice-audit.log",
+  "connect_timeout_ms": 8000,
+  "upstream_timeout_ms": 15000,
+  "_upstream_proxy_help": "Set to a downstream proxy 'host:port' (e.g. Burp at 127.0.0.1:8081) to chain Browser -> Splice -> Burp -> target. Empty = Splice dials the origin directly.",
+  "upstream_proxy": "127.0.0.1:8080",
+  "upstream_tls_insecure": true
+}
