@@ -15,6 +15,17 @@
       "name": "strip-utm-tracking",
       "pattern": "([?&])utm_[a-z]+=[^&\\r\\n ]*",
       "replacement": "$1"
+    },
+    {
+      "name": "strip-if-none-match",
+      "_why": "Remove the browser's cached ETag so the server returns a full 200 (with body) instead of a 304 Not Modified -- Splice's plugins/secret-hunt need the body.",
+      "pattern": "(?im)^If-None-Match:[^\\r\\n]*\\r\\n",
+      "replacement": ""
+    },
+    {
+      "name": "strip-if-modified-since",
+      "pattern": "(?im)^If-Modified-Since:[^\\r\\n]*\\r\\n",
+      "replacement": ""
     }
   ]
 }

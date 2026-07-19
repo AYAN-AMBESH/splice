@@ -80,6 +80,18 @@ let host_only = fn(host_port) {
     return parts[0];
 };
 
+// upstream_read_ms: how long to wait for the upstream response. When chaining
+// through a downstream proxy (Burp), the operator may hold the request in Burp's
+// Intercept and forward it by hand, so we wait longer (intercept_timeout_ms,
+// default 60s) instead of blocking the request as a spurious "upstream read
+// failed". Direct mode uses the normal upstream_timeout_ms.
+let upstream_read_ms = fn(cfg) {
+    if (field(cfg, "upstream_proxy", "") != "") {
+        return field(cfg, "intercept_timeout_ms", 60000);
+    };
+    return field(cfg, "upstream_timeout_ms", 15000);
+};
+
 // ---------------------------------------------------------------------------
 // Config
 // ---------------------------------------------------------------------------
@@ -174,17 +186,48 @@ let record_flow = fn(db, host, method, path, query) {
     return ep_id;
 };
 
-// record_finding: attach a finding node to an endpoint node and return its id.
-let record_finding = fn(db, ep_id, finding) {
-    let fattrs = {
-        "severity": field(finding, "severity", "info"),
-        "title": field(finding, "title", "finding"),
-        "detail": field(finding, "detail", ""),
-        "source": field(finding, "source", "plugin")
+// record_referer_edge: if the request carries a Referer, link the referring
+// endpoint to this one (endpoint --links_to--> endpoint) so db_shortest_path can
+// trace real navigation chains from an entry point to a sink on live traffic.
+let record_referer_edge = fn(db, headers, current_ep_id) {
+    let ref = field(headers, "Referer", "");
+    if (ref == "") { return false; };
+    let no_scheme, e1 = regex_replace("^https?://", ref, "");   // host/path?query
+    let noq = text_split(no_scheme, "?");
+    let parts = text_split(noq[0], "/");                          // [host, seg, ...]
+    let ref_host = parts[0];
+    if (ref_host == "") { return false; };
+    let ref_path = "/";
+    let i = 1;
+    for (; i < len(parts); i = i + 1) {
+        if (i > 1) { ref_path = ref_path + "/"; };
+        ref_path = ref_path + parts[i];
+    }
+    let ref_key = "ep:GET " + ref_host + ref_path;
+    let rattrs = {"host": ref_host, "method": "GET", "path": ref_path};
+    let ref_ep = intern_node(db, "endpoint", ref_key, rattrs);
+    if (ref_ep != current_ep_id) {
+        link(db, ref_ep, current_ep_id, "links_to");
     };
+    return true;
+};
+
+// record_finding: attach a finding node to an endpoint node, append it to the
+// findings log (if configured), and return its id.
+let record_finding = fn(st, ep_id, finding) {
+    let db = st["db"];
+    let sev = field(finding, "severity", "info");
+    let title = field(finding, "title", "finding");
+    let detail = field(finding, "detail", "");
+    let source = field(finding, "source", "plugin");
+    let fattrs = {"severity": sev, "title": title, "detail": detail, "source": source};
     let f_node, fe = db_add_artifact(db, "finding", fattrs);
     let f_id = f_node["node_id"];
     link(db, ep_id, f_id, "has_finding");
+    let flog = field(st, "findings_log", "");
+    if (flog != "") {
+        let w, we = fs_append(flog, sev + " | " + title + " | " + detail + " | " + source + LF);
+    };
     return f_id;
 };
 
@@ -344,7 +387,7 @@ let analyze_response = fn(st, ep_id, method, host, path, query, resp) {
     let k = 0;
     for (; k < len(all); k = k + 1) {
         let f = all[k];
-        record_finding(st["db"], ep_id, f);
+        record_finding(st, ep_id, f);
         putln("    [finding] ", field(f, "severity", "?"), " :: ", field(f, "title", "?"),
               " (", field(f, "source", "?"), ")");
     }
@@ -362,6 +405,15 @@ let deny_response = fn(reason) {
     return wire;
 };
 
+// error_response is for gateway/upstream failures (NOT policy denials): 502 so the
+// message isn't confused with a scope block.
+let error_response = fn(reason) {
+    let body = "Splice: upstream/gateway error -- " + reason + " (if chaining through Burp, check that Intercept is off or the request was forwarded)";
+    let resp = {"status": 502, "status_text": "Bad Gateway", "body": body, "headers": {}};
+    let wire, e = http_build_response(resp);
+    return wire;
+};
+
 // audit: append one tamper-evident decision line to the on-disk audit trail
 // (config `audit_log`). This is the persisted proof-of-scope artifact.
 let audit = fn(st, verdict, host, method, path, reason) {
@@ -370,6 +422,33 @@ let audit = fn(st, verdict, host, method, path, reason) {
         let line = verdict + " " + method + " " + host + path + " :: " + reason + LF;
         let w, we = fs_append(lg, line);
     };
+};
+
+// serve_report renders a live engagement report (graph size, scope decisions,
+// findings) to the client. Reached by browsing http://splice.report/ through the
+// proxy -- a built-in dashboard, no external tooling.
+let read_or = fn(path, dflt) {
+    if (path == "") { return dflt; };
+    let c, e = fs_read(path);
+    if (e) { return dflt; };
+    if (c == "") { return dflt; };
+    return c;
+};
+let serve_report = fn(st, client) {
+    let stats, se = db_stats(st["db"]);
+    let audit_txt = read_or(field(st, "audit_log", ""), "(no audit log)");
+    let find_txt = read_or(field(st, "findings_log", ""), "(no findings yet)");
+    let body = "=== SPLICE ENGAGEMENT REPORT ===\n\n" +
+        "Scope policy : policy/scope.rego (enforced, fail-closed)\n" +
+        "Graph sitemap: " + int_to_str(stats["nodes"]) + " nodes, " + int_to_str(stats["edges"]) + " edges\n\n" +
+        "--- Scope decisions (audit trail) ---\n" + audit_txt + "\n" +
+        "--- Findings (secret-hunt + Lua plugins) ---\n" + find_txt + "\n";
+    let resp = {"status": 200, "status_text": "OK", "body": body,
+                "headers": {"Content-Type": "text/plain; charset=utf-8"}};
+    let wire, we = http_build_response(resp);
+    net_conn_write(client, wire);
+    net_conn_close(client);
+    return true;
 };
 
 // open_https_upstream: return {ok, handle} for a connection over which we can do
@@ -386,7 +465,7 @@ let open_https_upstream = fn(host_port, cfg) {
         // A CONNECT reply is a status line + headers with NO body, so read raw
         // bytes (up to the blank line) rather than http_conn_read_response, which
         // would block trying to read a body that never arrives.
-        let rd, rde = net_conn_read(t, 4096, field(cfg, "upstream_timeout_ms", 15000));
+        let rd, rde = net_conn_read(t, 4096, upstream_read_ms(cfg));
         if (rde) { net_conn_close(t); return {"ok": false, "handle": 0, "err": rde}; };
         let ok200, o2e = regex_match("^HTTP/1.[0-9] 2[0-9][0-9]", rd["data"]);
         if (ok200) { return {"ok": true, "handle": t, "err": ""}; };
@@ -419,12 +498,219 @@ let relay_https = fn(host_port, host, request, cfg) {
     let wire, we = http_build_request(request);
     let mutated = apply_matchreplace(field(cfg, "rules", []), wire);
     net_conn_write(upstream, mutated);
-    let resp, rerr = http_conn_read_response(upstream, field(cfg, "upstream_timeout_ms", 15000));
+    let resp, rerr = http_conn_read_response(upstream, upstream_read_ms(cfg));
     net_conn_close(upstream);
     if (rerr) {
         return {"status": 502, "status_text": "Bad Gateway", "body": "splice: upstream read failed", "headers": {}};
     };
     return resp;
+};
+
+// relay_stream is the streaming HTTPS relay: it reads only the response head, then
+// pumps the body from upstream to the client in chunks (no 32 MiB whole-body cap),
+// scanning a bounded prefix for findings. It writes directly to the client and
+// manages the connection lifecycle, returning true. "Connection: close" is forced
+// upstream so the body is delimited by close for chunked/unknown-length responses;
+// Content-Length responses are pumped exactly (no timeout wait).
+let SPLICE_SCAN_MAX = 65536;
+let relay_stream = fn(client, host_port, host, request, st, ep_id, method, path, query) {
+    let cfg = st["cfg"];
+    let conn = open_https_upstream(host_port, cfg);
+    if (conn["ok"] == false) {
+        net_conn_write(client, error_response("upstream connect failed"));
+        net_conn_close(client);
+        return false;
+    };
+    let upstream = conn["handle"];
+    let insec = false;
+    if (field(cfg, "upstream_proxy", "") != "") { insec = field(cfg, "upstream_tls_insecure", false); };
+    let ti, terr = net_tls_upgrade_client(upstream, {"server_name": host, "insecure": insec});
+    if (terr) {
+        net_conn_close(upstream);
+        net_conn_write(client, error_response("upstream TLS failed"));
+        net_conn_close(client);
+        return false;
+    };
+
+    // Build request, apply match/replace, force Connection: close upstream.
+    let wire, we = http_build_request(request);
+    let mutated = apply_matchreplace(field(cfg, "rules", []), wire);
+    let noconn, nce = regex_replace("(?i)\r\nConnection:[^\r\n]*", mutated, "");
+    let reqfinal, rfe = regex_replace("(?i)(\r\nHost:[^\r\n]*)", noconn, "$1\r\nConnection: close");
+    net_conn_write(upstream, reqfinal);
+
+    // Read only the head; the body stays on the upstream reader.
+    let head, he = http_conn_read_response_head(upstream, upstream_read_ms(cfg));
+    if (he) {
+        net_conn_close(upstream);
+        net_conn_write(client, error_response("upstream read failed"));
+        net_conn_close(client);
+        return false;
+    };
+
+    // Client head: preserve the original headers; drop the Content-Length: 0 that
+    // http_build_response adds for a body-less build; re-add chunked framing when
+    // the upstream was chunked so the client dechunks the verbatim body.
+    let hr = {"status": head["status"], "status_text": field(head, "status_text", "OK"),
+              "proto": field(head, "proto", "HTTP/1.1"), "headers": head["headers"], "body": ""};
+    let head_wire, hwe = http_build_response(hr);
+    let hw2, e2 = regex_replace("(?i)\r\nContent-Length: 0\r\n", head_wire, "\r\n");
+    let hw3 = hw2;
+    if (head["chunked"]) {
+        let x1, x1e = regex_replace("\r\n\r\n$", hw2, "\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n");
+        hw3 = x1;
+    } else {
+        let x2, x2e = regex_replace("\r\n\r\n$", hw2, "\r\nConnection: close\r\n\r\n");
+        hw3 = x2;
+    };
+    net_conn_write(client, hw3);
+    putln("  [stream ] ", method, " https://", host, path, " status=", head["status"]);
+
+    // Responses that MUST NOT carry a body (RFC 7230/7232): 1xx, 204, 304, and any
+    // reply to HEAD. Do NOT pump — a 304/204 often still carries a (misleading)
+    // Content-Length, and waiting for a body that never arrives is what made the
+    // proxy hang. The client knows these statuses are bodyless.
+    let status = head["status"];
+    let no_body = false;
+    if (method == "HEAD") { no_body = true; };
+    if (status == 204) { no_body = true; };
+    if (status == 304) { no_body = true; };
+    if (status > 99) { if (status < 200) { no_body = true; }; };
+    if (no_body) {
+        net_conn_close(upstream);
+        putln("  [response ] ", status, " (no body)");
+        let sresp0 = {"status": status, "headers": head["headers"], "body": ""};
+        analyze_response(st, ep_id, method, host, path, query, sresp0);
+        net_conn_close(client);
+        return true;
+    };
+
+    // Pump body: upstream -> client, accumulate a bounded scan prefix.
+    let cl = field(head, "content_length", 0 - 1);
+    let prefix = "";
+    let total = 0;
+    let done = false;
+    for (; done == false; ) {
+        let want = 32768;
+        if (cl > 0 - 1) {
+            let remaining = cl - total;
+            if (remaining < want) { want = remaining; };
+        };
+        if (want < 1) {
+            done = true;
+        } else {
+            let rd, rde = net_conn_read(upstream, want, upstream_read_ms(cfg));
+            let n = rd["bytes"];
+            if (n > 0) {
+                net_conn_write(client, rd["data"]);
+                total = total + n;
+                if (len(prefix) < SPLICE_SCAN_MAX) { prefix = prefix + rd["data"]; };
+            };
+            if (rd["eof"]) { done = true; };
+            if (rde) { done = true; };
+            if (cl > 0 - 1) { if (total > cl - 1) { done = true; }; };
+        };
+    }
+    net_conn_close(upstream);
+    putln("  [response ] ", head["status"], " (", total, " bytes streamed)");
+
+    let sresp = {"status": head["status"], "headers": head["headers"], "body": prefix};
+    analyze_response(st, ep_id, method, host, path, query, sresp);
+    net_conn_close(client);
+    return true;
+};
+
+// ---------------------------------------------------------------------------
+// WebSocket interception (RFC 6455) — full-duplex relay with frame logging
+// ---------------------------------------------------------------------------
+
+let is_ws_upgrade = fn(headers) {
+    let up = field(headers, "Upgrade", "");
+    let m, e = regex_match("(?i)websocket", up);
+    return m;
+};
+
+// ws_pump relays frames from src to dst until close/error, logging each. mask_out
+// is true for client->server (frames must be masked), false for server->client.
+let ws_pump = fn(src, dst, mask_out, label) {
+    let done = false;
+    for (; done == false; ) {
+        let f, fe = ws_read_frame(src, 120000);
+        if (fe) {
+            done = true;
+        } else {
+            putln("  [ws ", label, "] op=", f["opcode"], " len=", f["length"]);
+            let w, we = ws_write_frame(dst, f["opcode"], f["payload"], mask_out);
+            if (we) { done = true; };
+            if (f["opcode"] == 8) { done = true; };
+        };
+    }
+    return true;
+};
+
+// relay_websocket intercepts a WebSocket after the HTTP Upgrade: it opens the
+// upstream, relays the handshake, then pumps frames both ways (the reverse
+// direction on its own goroutine via net_spawn) so full-duplex traffic is
+// inspected. Each frame is logged; the WS endpoint is recorded in the graph.
+let relay_websocket = fn(client, host_port, host, request, st, ep_id) {
+    let cfg = st["cfg"];
+    let conn = open_https_upstream(host_port, cfg);
+    if (conn["ok"] == false) {
+        net_conn_write(client, error_response("ws upstream connect failed"));
+        net_conn_close(client);
+        return false;
+    };
+    let upstream = conn["handle"];
+    let insec = false;
+    if (field(cfg, "upstream_proxy", "") != "") { insec = field(cfg, "upstream_tls_insecure", false); };
+    let opts = {"server_name": host, "insecure": insec};
+    let info, terr = net_tls_upgrade_client(upstream, opts);
+    if (terr) {
+        net_conn_close(upstream);
+        net_conn_close(client);
+        return false;
+    };
+
+    // Forward the client's Upgrade request to the upstream.
+    let wire, we = http_build_request(request);
+    net_conn_write(upstream, wire);
+
+    // Consume the upstream's 101 headers (leaves frames on the reader) and verify.
+    let uhead, ue = http_conn_read_response_head(upstream, upstream_read_ms(cfg));
+    if (ue) {
+        net_conn_close(upstream);
+        net_conn_close(client);
+        return false;
+    };
+    if (uhead["status"] != 101) {
+        putln("  [ws] upstream did not upgrade (status ", uhead["status"], ")");
+        net_conn_close(upstream);
+        net_conn_close(client);
+        return false;
+    };
+
+    // Build the client's 101 from ITS Sec-WebSocket-Key and send it.
+    let ckey = field(request["headers"], "Sec-Websocket-Key", "");
+    let accept, ae = ws_accept_key(ckey);
+    let resp101 = "HTTP/1.1 101 Switching Protocols" + CRLF +
+                  "Upgrade: websocket" + CRLF + "Connection: Upgrade" + CRLF +
+                  "Sec-WebSocket-Accept: " + accept + CRLF + CRLF;
+    net_conn_write(client, resp101);
+    putln("  [ws intercept] wss://", host, request["path"], " (full-duplex)");
+
+    let wf = {"severity": "info", "title": "WebSocket established", "detail": host + request["path"], "source": "websocket"};
+    record_finding(st, ep_id, wf);
+
+    // Reverse pump (upstream->client, unmasked) on a new goroutine; forward pump
+    // (client->upstream, masked) runs here.
+    let pump_ctx = {"mode": "ws_pump", "src": upstream, "dst": client, "mask_out": false, "label": "s->c"};
+    let sp, spe = net_spawn(join(st["root"], "splice.mut"), pump_ctx);
+    ws_pump(client, upstream, true, "c->s");
+
+    // Forward side ended -> close both to unblock the reverse pump goroutine.
+    net_conn_close(upstream);
+    net_conn_close(client);
+    return true;
 };
 
 let handle_connect = fn(client, st, host_port) {
@@ -476,9 +762,21 @@ let handle_connect = fn(client, st, host_port) {
     if (d2["allow"]) {
         audit(st, "ALLOW", host, method, path, d2["reason"]);
         let ep_id = record_flow(st["db"], host, method, path, query);
+        record_referer_edge(st["db"], request["headers"], ep_id);
+        // WebSocket upgrade -> full-duplex frame relay (manages its own lifecycle).
+        if (is_ws_upgrade(request["headers"])) {
+            return relay_websocket(client, host_port, host, request, st, ep_id);
+        };
+        // Streaming relay (default): pumps the body through without buffering the
+        // whole thing. It writes to the client and returns.
+        if (field(cfg, "stream", true)) {
+            return relay_stream(client, host_port, host, request, st, ep_id, method, path, query);
+        };
         putln("  [intercept] ", method, " https://", host, path);
+        let t0, t0e = time_ms();
         let resp = relay_https(host_port, host, request, cfg);
-        putln("  [response ] ", field(resp, "status", 0));
+        let t1, t1e = time_ms();
+        putln("  [response ] ", field(resp, "status", 0), " (", t1 - t0, "ms)");
         analyze_response(st, ep_id, method, host, path, query, resp);
         let back, be = http_build_response(resp);
         net_conn_write(client, back);
@@ -498,6 +796,11 @@ let handle_plain = fn(client, st, request) {
     let path = field(request, "path", "/");
     let query = field(request, "query", "");
 
+    // Built-in report dashboard: browse http://splice.report/ through the proxy.
+    if (host == "splice.report") {
+        return serve_report(st, client);
+    };
+
     let d = decide(st["pol"], host, method, path);
     if (d["allow"]) {
         putln("  [allow ] ", method, " http://", host, path, " (", d["reason"], ")");
@@ -511,6 +814,8 @@ let handle_plain = fn(client, st, request) {
     };
 
     let ep_id = record_flow(st["db"], host, method, path, query);
+    record_referer_edge(st["db"], request["headers"], ep_id);
+    let t0, t0e = time_ms();
     // Plain HTTP forwards absolute-form. To a downstream proxy (Burp) that IS
     // the wire format it expects, so we only switch the dial target; to an
     // origin we send it directly on :80.
@@ -519,21 +824,22 @@ let handle_plain = fn(client, st, request) {
     if (up_proxy != "") { target = up_proxy; };
     let upstream, err = net_connect(target, field(cfg, "connect_timeout_ms", 8000));
     if (err) {
-        net_conn_write(client, deny_response("upstream connect failed"));
+        net_conn_write(client, error_response("upstream connect failed"));
         net_conn_close(client);
         return false;
     };
     let wire, we = http_build_request(request);
     let mutated = apply_matchreplace(field(cfg, "rules", []), wire);
     net_conn_write(upstream, mutated);
-    let resp, rerr = http_conn_read_response(upstream, field(cfg, "upstream_timeout_ms", 15000));
+    let resp, rerr = http_conn_read_response(upstream, upstream_read_ms(cfg));
     net_conn_close(upstream);
     if (rerr) {
-        net_conn_write(client, deny_response("upstream read failed"));
+        net_conn_write(client, error_response("upstream read failed"));
         net_conn_close(client);
         return false;
     };
-    putln("  [response ] ", field(resp, "status", 0));
+    let t1, t1e = time_ms();
+    putln("  [response ] ", field(resp, "status", 0), " (", t1 - t0, "ms)");
     analyze_response(st, ep_id, method, host, path, query, resp);
     let back, be = http_build_response(resp);
     net_conn_write(client, back);
@@ -605,6 +911,30 @@ let run_proxy = fn(st) {
             handle_client(acc["handle"], st);
         };
     }
+    return true;
+};
+
+// run_proxy_concurrent: like run_proxy but dispatches each connection to its own
+// VM via net_serve, so simultaneous requests are handled in parallel. The handler
+// is THIS same file (splice.mut) — main() detects handler mode via serve_conn()
+// and calls handle_client. The engagement state (st) is passed as serve_arg; the
+// graph DB, dedup cache and audit log are process-global, so concurrent handlers
+// share them safely.
+let run_proxy_concurrent = fn(st) {
+    let cfg = st["cfg"];
+    let bind = field(cfg, "bind", "127.0.0.1:8080");
+    putln("=== Splice intercepting proxy (concurrent) ===");
+    putln("Trust this CA certificate in your client to intercept HTTPS:");
+    putln(st["ca"]["cert_pem"]);
+    let ln, err = net_listen(bind);
+    if (err) {
+        putln("listen failed: ", err);
+        return false;
+    };
+    putln("proxy listening on ", bind, " (concurrent). Scope enforced by policy/scope.rego.");
+    let handler_path = join(st["root"], "splice.mut");
+    let ok, serr = net_serve(ln, handler_path, st);
+    putln("serve ended: ", serr);
     return true;
 };
 
@@ -680,7 +1010,7 @@ let run_selftest = fn(st) {
     putln("[4] Attack-path query (entry point -> sensitive sink)");
     // Attach a dedicated high-severity sink finding and path to it.
     let sink = {"severity": "high", "title": "Reflected + key leak sink", "detail": "search", "source": "correlation"};
-    let sink_id = record_finding(db, search_ep, sink);
+    let sink_id = record_finding(st, search_ep, sink);
     let path, pe = db_shortest_path(db, entry_ep, sink_id);
     check("path exists from entry to sink", len(path) > 2);
     putln("  chain (node ids): ", path[0], " -> ", path[1], " -> ", path[2],
@@ -701,6 +1031,25 @@ let run_selftest = fn(st) {
 // ---------------------------------------------------------------------------
 
 let main = fn() {
+    // Handler mode: net_serve compiled this same file for one connection.
+    // serve_conn() returns the connection handle (null in the main VM).
+    let sc, sce = serve_conn();
+    if (sc) {
+        let hst, hae = serve_arg();
+        handle_client(sc, hst);
+        return true;
+    };
+
+    // Auxiliary worker spawned via net_spawn (no connection): e.g. a WebSocket
+    // reverse pump. Dispatch on the arg's mode.
+    let sa, sae = serve_arg();
+    if (sa) {
+        if (field(sa, "mode", "") == "ws_pump") {
+            ws_pump(sa["src"], sa["dst"], sa["mask_out"], field(sa, "label", "pump"));
+            return true;
+        };
+    };
+
     let cfg = load_config(CONFIG_PATH);
     if (cfg == false) { return false; };
     let root = field(cfg, "root", ".");
@@ -721,17 +1070,22 @@ let main = fn() {
         "rules": rules,
         "connect_timeout_ms": field(cfg, "connect_timeout_ms", 8000),
         "upstream_timeout_ms": field(cfg, "upstream_timeout_ms", 15000),
+        "intercept_timeout_ms": field(cfg, "intercept_timeout_ms", 60000),
         "upstream_proxy": field(cfg, "upstream_proxy", ""),
-        "upstream_tls_insecure": field(cfg, "upstream_tls_insecure", false)
+        "upstream_tls_insecure": field(cfg, "upstream_tls_insecure", false),
+        "stream": field(cfg, "stream", true)
     };
 
     let audit_log = "";
     if (field(cfg, "audit_log", "") != "") { audit_log = join(root, field(cfg, "audit_log", "")); };
+    let findings_log = "";
+    if (field(cfg, "findings_log", "") != "") { findings_log = join(root, field(cfg, "findings_log", "")); };
 
     let st = {
         "cfg": cfg2,
         "pol": pol_module,
         "db": db,
+        "findings_log": findings_log,
         "plugins": field(cfg, "plugins", []),
         "root": root,
         "audit_log": audit_log
@@ -756,9 +1110,13 @@ let main = fn() {
     let st2 = {
         "cfg": cfg2, "pol": pol_module, "db": db,
         "plugins": field(cfg, "plugins", []), "root": root, "ca": ca,
-        "audit_log": audit_log
+        "audit_log": audit_log, "findings_log": findings_log
     };
-    return run_proxy(st2);
+    // Concurrent by default; set "serial": true in config for the legacy loop.
+    if (field(cfg, "serial", false)) {
+        return run_proxy(st2);
+    };
+    return run_proxy_concurrent(st2);
 };
 
 let done = main();

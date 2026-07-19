@@ -17,8 +17,11 @@
   "ca_cert_path": "ca/splice-ca.pem",
   "ca_key_path": "ca/splice-ca-key.pem",
   "audit_log": "splice-audit.log",
+  "findings_log": "splice-findings.log",
   "connect_timeout_ms": 8000,
   "upstream_timeout_ms": 15000,
+  "_intercept_timeout_help": "When chained through Burp, how long Splice waits for the upstream response so you can hold+forward in Burp's Intercept without Splice timing out. Default 60s.",
+  "intercept_timeout_ms": 60000,
   "_upstream_proxy_help": "Set to a downstream proxy 'host:port' (e.g. Burp at 127.0.0.1:8081) to chain Browser -> Splice -> Burp -> target. Empty = Splice dials the origin directly.",
   "upstream_proxy": "127.0.0.1:8080",
   "upstream_tls_insecure": true
